@@ -1,0 +1,28 @@
+# Milestone 1 -- DA3 only. Marigold's deps (diffusers, transformers,
+# accelerate) are intentionally not listed yet; add them in Milestone 2.
+
+torch>=2
+torchvision
+xformers
+numpy<2
+opencv-python
+pillow
+PySide6
+
+# Depth Anything 3 is NOT a normal PyPI package -- install it from source:
+#
+#   git clone https://github.com/ByteDance-Seed/depth-anything-3
+#   cd depth-anything-3
+#   pip install -e .
+#
+# That editable install pulls in DA3's full dependency set regardless of
+# whether Depth Studio uses it (trimesh, huggingface_hub, einops, imageio,
+# open3d, fastapi, uvicorn, requests, typer, omegaconf, evo, e3nn, moviepy,
+# plyfile, pillow_heif, safetensors, pycolmap) -- there is no lighter
+# "depth-only" install target upstream. Budget for this footprint; see
+# README.md.
+#
+# numpy<2 above is DA3's own hard pin, not this project's choice.
+fastapi
+python-multipart
+uvicorn[standard]
