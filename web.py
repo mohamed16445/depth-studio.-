@@ -2,88 +2,322 @@ from __future__ import annotations
 
 import io
 import os
-import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
+import torch
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
-from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
-from app.core.depth_data import DepthResult
-from app.core.image_io import SUPPORTED_EXTENSIONS, load_source_image
-from app.engines.da3.engine import DA3Engine
-from app.export.depth_png16 import export_depth_16bit_png
+from depth_anything_3.api import DepthAnything3
+
+
+# ============================================================
+# Depth Studio
+# Depth Anything 3 backend
+# ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 INDEX = BASE_DIR / "index.html"
 
-app = FastAPI(title="Depth Studio", version="1.0.0")
+app = FastAPI(
+    title="Depth Studio",
+    version="2.0.0",
+)
 
-_engine: DA3Engine | None = None
+# ------------------------------------------------------------
+# Model settings
+# ------------------------------------------------------------
+
+MODEL_NAME = os.getenv(
+    "DA3_MODEL",
+    "depth-anything/DA3-LARGE",
+)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+_model: DepthAnything3 | None = None
 
 
-def get_engine() -> DA3Engine:
-    global _engine
-    if _engine is None:
-        checkpoint = os.getenv("DA3_CHECKPOINT", "depth-anything/da3mono-large")
-        _engine = DA3Engine(checkpoint=checkpoint)
-    return _engine
+# ------------------------------------------------------------
+# Load Depth Anything 3
+# ------------------------------------------------------------
 
+def get_model() -> DepthAnything3:
+    global _model
+
+    if _model is None:
+        print(f"[Depth Studio] Loading Depth Anything 3...")
+        print(f"[Depth Studio] Model: {MODEL_NAME}")
+        print(f"[Depth Studio] Device: {DEVICE}")
+
+        _model = DepthAnything3.from_pretrained(MODEL_NAME)
+        _model = _model.to(DEVICE)
+        _model.eval()
+
+        print("[Depth Studio] Depth Anything 3 loaded successfully.")
+
+    return _model
+
+
+# ------------------------------------------------------------
+# Health check
+# ------------------------------------------------------------
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "engine": "Depth Anything 3"}
+    return {
+        "ok": True,
+        "engine": "Depth Anything 3",
+        "model": MODEL_NAME,
+        "device": DEVICE,
+    }
 
+
+# ------------------------------------------------------------
+# Homepage
+# ------------------------------------------------------------
 
 @app.get("/")
 def home():
-    return FileResponse(INDEX, media_type="text/html")
+    if not INDEX.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="index.html not found",
+        )
 
+    return FileResponse(
+        INDEX,
+        media_type="text/html",
+    )
+
+
+# ------------------------------------------------------------
+# Normalize depth
+# ------------------------------------------------------------
+
+def normalize_depth(depth: np.ndarray) -> np.ndarray:
+    """
+    Convert Depth Anything 3 output into
+    a clean 16-bit grayscale depth map.
+    """
+
+    depth = np.asarray(depth, dtype=np.float32)
+
+    # Remove invalid values
+    finite = np.isfinite(depth)
+
+    if not np.any(finite):
+        raise ValueError("Depth prediction contains no valid values.")
+
+    valid = depth[finite]
+
+    minimum = float(valid.min())
+    maximum = float(valid.max())
+
+    # Avoid division by zero
+    if maximum - minimum < 1e-8:
+        return np.zeros(depth.shape, dtype=np.uint16)
+
+    depth = np.nan_to_num(
+        depth,
+        nan=minimum,
+        posinf=maximum,
+        neginf=minimum,
+    )
+
+    depth = (depth - minimum) / (maximum - minimum)
+
+    depth = np.clip(
+        depth,
+        0.0,
+        1.0,
+    )
+
+    return (depth * 65535.0).astype(np.uint16)
+
+
+# ------------------------------------------------------------
+# Generate depth map
+# ------------------------------------------------------------
 
 @app.post("/api/generate")
-async def generate_depth(file: UploadFile = File(...), direction: str = "normal"):
+async def generate_depth(
+    file: UploadFile = File(...),
+    direction: str = "normal",
+):
     if direction not in {"normal", "inverted"}:
-        raise HTTPException(status_code=400, detail="direction must be normal or inverted")
+        raise HTTPException(
+            status_code=400,
+            detail="direction must be normal or inverted",
+        )
 
-    suffix = Path(file.filename or "").suffix.lower()
-    if suffix not in SUPPORTED_EXTENSIONS:
-        raise HTTPException(status_code=415, detail="Unsupported image format")
+    filename = file.filename or ""
+
+    suffix = Path(filename).suffix.lower()
+
+    supported = {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+    }
+
+    if suffix not in supported:
+        raise HTTPException(
+            status_code=415,
+            detail="Unsupported image format",
+        )
 
     raw = await file.read()
+
     if not raw:
-        raise HTTPException(status_code=400, detail="Empty image")
+        raise HTTPException(
+            status_code=400,
+            detail="Empty image",
+        )
+
+    # 20 MB maximum upload
     if len(raw) > 20 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Image is larger than 20 MB")
+        raise HTTPException(
+            status_code=413,
+            detail="Image is larger than 20 MB",
+        )
+
+    start_time = time.perf_counter()
 
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            source_path = Path(tmp) / f"source{suffix}"
-            source_path.write_bytes(raw)
-            source = load_source_image(source_path)
+        # ----------------------------------------------------
+        # Read image
+        # ----------------------------------------------------
 
-            prediction = get_engine().predict(source.array_rgb)
-            result = DepthResult(prediction=prediction, direction=direction)  # type: ignore[arg-type]
-            normalized = result.normalized()
+        image = Image.open(
+            io.BytesIO(raw)
+        ).convert("RGB")
 
-            output_path = Path(tmp) / "depth.png"
-            export_depth_16bit_png(normalized, output_path)
-            png_bytes = output_path.read_bytes()
+        original_width, original_height = image.size
 
-            headers = {
-                "X-Depth-Width": str(source.width),
-                "X-Depth-Height": str(source.height),
-                "X-Inference-Seconds": f"{prediction.inference_seconds:.3f}",
-                "Content-Disposition": 'attachment; filename="depth-map-16bit.png"',
-            }
-            return Response(content=png_bytes, media_type="image/png", headers=headers)
+        # ----------------------------------------------------
+        # Get model
+        # ----------------------------------------------------
+
+        model = get_model()
+
+        # ----------------------------------------------------
+        # Run Depth Anything 3
+        # ----------------------------------------------------
+
+        with torch.inference_mode():
+
+            prediction = model.inference(
+                images=[image],
+                process_res=504,
+            )
+
+        # ----------------------------------------------------
+        # Get depth
+        # ----------------------------------------------------
+
+        depth = prediction.depth[0]
+
+        depth = np.asarray(
+            depth,
+            dtype=np.float32,
+        )
+
+        # ----------------------------------------------------
+        # Resize depth back to original image size
+        # ----------------------------------------------------
+
+        depth_image = Image.fromarray(
+            depth,
+            mode="F",
+        )
+
+        depth_image = depth_image.resize(
+            (
+                original_width,
+                original_height,
+            ),
+            Image.Resampling.BILINEAR,
+        )
+
+        depth = np.asarray(
+            depth_image,
+            dtype=np.float32,
+        )
+
+        # ----------------------------------------------------
+        # Normalize to 16-bit
+        # ----------------------------------------------------
+
+        depth16 = normalize_depth(depth)
+
+        # ----------------------------------------------------
+        # Invert if requested
+        # ----------------------------------------------------
+
+        if direction == "inverted":
+            depth16 = 65535 - depth16
+
+        # ----------------------------------------------------
+        # Export PNG
+        # ----------------------------------------------------
+
+        output = io.BytesIO()
+
+        Image.fromarray(
+            depth16,
+            mode="I;16",
+        ).save(
+            output,
+            format="PNG",
+        )
+
+        png_bytes = output.getvalue()
+
+        elapsed = time.perf_counter() - start_time
+
+        # ----------------------------------------------------
+        # Response
+        # ----------------------------------------------------
+
+        headers = {
+            "X-Depth-Width": str(original_width),
+            "X-Depth-Height": str(original_height),
+            "X-Inference-Seconds": f"{elapsed:.3f}",
+            "X-Depth-Engine": "Depth Anything 3",
+            "X-Depth-Model": MODEL_NAME,
+            "Content-Disposition": (
+                'attachment; filename="depth-map-16bit.png"'
+            ),
+        }
+
+        return Response(
+            content=png_bytes,
+            media_type="image/png",
+            headers=headers,
+        )
+
     except HTTPException:
         raise
+
+    except torch.cuda.OutOfMemoryError as exc:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        raise HTTPException(
+            status_code=507,
+            detail=(
+                "GPU out of memory. "
+                "Try a smaller input image."
+            ),
+        ) from exc
+
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Depth generation failed: {exc}") from exc
-
-
-# Keep the project usable as a simple static website when opened from a static host.
-# The real generator endpoint is provided by this FastAPI server.
-app.mount("/static", StaticFiles(directory=str(BASE_DIR)), name="static")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Depth generation failed: {exc}",
+        ) from exc
