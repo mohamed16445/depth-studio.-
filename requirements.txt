@@ -14,4 +14,3 @@ uvicorn[standard]
 
 git+https://github.com/ByteDance-Seed/Depth-Anything-3.git
 
-g
